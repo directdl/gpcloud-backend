@@ -5,10 +5,10 @@ import pymysql
 
 
 DB_CONFIG: Dict[str, Any] = {
-    'host': '45.93.9.105',
-    'database': 'db_name_mysql',
-    'user': 'db_user_name',
-    'password': 'passs',
+    'host': '146.103.41.168',
+    'database': 'gpcloud',
+    'user': 'gpcloud',
+    'password': '01759335737',
     'charset': 'utf8mb4',
     'port': 8860,
     'cursorclass': pymysql.cursors.DictCursor,
@@ -103,5 +103,6 @@ class MySQLStatusClient:
 
 # Module-level singleton (optional use)
 mysql_status_client = MySQLStatusClient()
+
 
 
