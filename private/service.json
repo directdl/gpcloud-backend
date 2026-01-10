@@ -1,0 +1,28 @@
+[
+  {
+    "type": "service_account",
+    "project_id": "filecloud-452316",
+    "private_key_id": "5c",
+    "private_key": "-----BEG",
+    "client_email": "filecloud-05@filecloud-452316.iam.gserviceaccount.com",
+    "client_id": "107574395275600303055",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/filecloud-05%40filecloud-452316.iam.gserviceaccount.com",
+    "universe_domain": "googleapis.com"
+  },
+  {
+    "type": "service_account",
+    "project_id": "filecloud-452316",
+    "private_key_id": "a7523d7aae7d1310390e08311b3f7aec751f2abf",
+    "private_key": "AASCBKcwggSjAgEA",
+    "client_email": "",
+    "client_id": "110751976438669509703",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/filecloud-04%40filecloud-452316.iam.gserviceaccount.com",
+    "universe_domain": "googleapis.com"
+  }
+]

@@ -1,0 +1,14 @@
+{
+    "users": [
+        {
+            "username": "admin",
+            "api_key": "123456kndfsjhlhi894jkfdsjfkjkfdsjksfdn34567890abcdef",
+            "is_active": true
+        },
+        {
+            "username": "user001",
+            "api_key": "api001_abcdef1hjfhjsfdhjdfjs90ghijklmnopqrstuv",
+            "is_active": true
+        }
+    ]
+}

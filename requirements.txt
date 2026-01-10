@@ -1,0 +1,16 @@
+flask
+python-dotenv
+requests
+pymongo
+humanize
+google-auth-oauthlib
+google-auth
+google-api-python-client
+gunicorn
+rich>=13.9.0
+bbpb>=1.4.2
+pymysql
+cryptography
+redis==5.0.1
+hiredis==2.2.3
+aiohttp>=3.9.0
