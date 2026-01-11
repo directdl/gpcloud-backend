@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request, Response
 import secrets
+import string
 import threading
 import os
 import shutil
@@ -30,6 +31,11 @@ if TYPE_CHECKING:  # pragma: no cover
     from queue import Queue
 
 ResponseData = Dict[str, Any]
+
+ALPHABET = string.ascii_lowercase + string.digits
+
+def gen_token(length=8):
+    return ''.join(secrets.choice(ALPHABET) for _ in range(length))
 
 def _convert_filesize_to_raw_size(filesize_str: Optional[str]) -> Optional[int]:
     """Convert human-readable filesize string to raw bytes"""
@@ -403,7 +409,13 @@ def generate_link(api_key: str, drive_path: str) -> Union[Response, tuple[Respon
                 }), 500  # Changed from 400 to 500 for general errors
 
             # Generate new token and save link
-            token = secrets.token_urlsafe(16)
+            for _ in range(20):
+                token = gen_token(8)
+                if not db.token_exists(token):
+                    break
+            else:
+                return jsonify({"success": False, "message": "token generation failed"}), 500
+
             db.save_link(
                 token=token,
                 drive_id=file_id,
