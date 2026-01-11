@@ -5,6 +5,7 @@ import logging
 import aiohttp
 import asyncio
 from typing import Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +16,10 @@ class VikingFile:
     def __init__(self) -> None:
         """Initializes the VikingFile client."""
         self.user_hash = os.getenv('VIKINGFILE_USER_HASH', '')  # Empty for anonymous
-        
+
         # Worker URLs for fallback download
         self.worker_urls = os.getenv('WORKER_URL', '').strip()
-        
+
         # VikingFile API endpoints
         self.api_base = 'https://vikingfile.com/api'
         self.get_server_url = f'{self.api_base}/get-server'
@@ -40,7 +41,7 @@ class VikingFile:
         try:
             from plugins.gphotos import NewGPhotos
             from api.common import simple_decrypt
-            
+
             # Decrypt gphotos_id if encrypted
             decrypted_id = gphotos_id
             if len(gphotos_id) > 20 and not gphotos_id.startswith('AF1Q'):
@@ -51,48 +52,41 @@ class VikingFile:
                 except Exception as e:
                     logger.error(f"Decryption error: {e}")
                     return None
-            
+
             # Get download URLs using NewGPhotos
             gphotos = NewGPhotos()
             download_data = gphotos.client.api.get_download_urls(decrypted_id)
 
             if not download_data:
                 return None
-            
-            # Extract download URL using the EXACT same logic as working NewGPhotos.download_by_media_key
+
             download_url = None
             original_filename = None
             if isinstance(download_data, dict):
                 try:
-                    # Extract filename from response - structure: {'1': {'2': {'4': 'filename.mkv'}}}
                     if '1' in download_data and '2' in download_data['1'] and '4' in download_data['1']['2']:
                         original_filename = download_data['1']['2']['4']
-                    
-                    # Response structure from logs: {'1': {'5': {'3': {'5': 'download_url'}}}}
+
                     if '1' in download_data and '5' in download_data['1']:
                         url_data = download_data['1']['5']
                         if '3' in url_data and '5' in url_data['3']:
                             download_url = url_data['3']['5']
                         elif isinstance(url_data, dict):
-                            # Alternative structure - find URL in nested dict
                             for key, value in url_data.items():
                                 if isinstance(value, dict) and '5' in value:
                                     if isinstance(value['5'], str) and value['5'].startswith('https://'):
                                         download_url = value['5']
                                         break
-                    
-                    # Log analysis shows URL is in nested structure, try common patterns
+
                     if not download_url and '1' in download_data:
                         data_1 = download_data['1']
                         if '5' in data_1 and isinstance(data_1['5'], dict):
-                            # Check for direct URL in '5' field 
                             for k, v in data_1['5'].items():
                                 if isinstance(v, dict) and '5' in v:
                                     if isinstance(v['5'], str) and 'googleusercontent.com' in v['5']:
                                         download_url = v['5']
                                         break
-                    
-                    # Fallback: look for any HTTPS URL in the response
+
                     if not download_url:
                         def find_url_recursive(data):
                             if isinstance(data, dict):
@@ -109,50 +103,105 @@ class VikingFile:
                                     if result:
                                         return result
                             return None
-                        
+
                         download_url = find_url_recursive(download_data)
-                        
+
                 except Exception as e:
                     logger.error(f"Error parsing download response: {e}")
-            
+
             if not download_url:
                 return None
 
             return download_url
-                
+
         except Exception as e:
             logger.error(f"Error getting Google Photos download URL: {e}")
             return None
 
-    def _get_worker_download_url(self, file_id: str) -> Optional[str]:
-        """Get worker download URL as fallback."""
+    def _get_worker_url_candidates(self, file_id: str) -> list[str]:
+        """Build worker download URL candidates (supports /id/ fallback + legacy patterns)."""
         if not self.worker_urls:
-            return None
-        
-        # Parse multiple URLs (comma-separated)
-        urls = [url.strip() for url in self.worker_urls.split(',') if url.strip()]
+            return []
+
+        urls = [u.strip() for u in self.worker_urls.split(',') if u.strip()]
         if not urls:
-            return None
-        
-        # Use first available worker URL
-        base_url = urls[0]
-        if base_url.endswith('/'):
-            base_url = base_url.rstrip('/')
-        
-        # Check if URL already has download endpoint
-        if 'download.aspx' in base_url or '/download' in base_url:
-            worker_url = f"{base_url}?id={file_id}"
-        else:
-            worker_url = f"{base_url}/download.aspx?id={file_id}"
-        
-        return worker_url
+            return []
+
+        fid = quote(str(file_id).strip(), safe="") if file_id is not None else ""
+        if not fid:
+            return []
+
+        candidates: list[str] = []
+
+        for base_url in urls:
+            b = base_url.strip()
+            if not b:
+                continue
+            b = b.rstrip('/')
+
+            # Placeholder support: https://worker.site/id/{id}  OR  https://worker.site/{id}
+            if "{id}" in b:
+                candidates.append(b.replace("{id}", fid))
+                continue
+
+            low = b.lower()
+
+            # If already includes query id
+            if "?id=" in low or "&id=" in low:
+                if low.endswith("="):
+                    candidates.append(f"{b}{fid}")
+                else:
+                    candidates.append(b)
+                continue
+
+            # Legacy patterns
+            if "download.aspx" in low:
+                candidates.append(f"{b}?id={fid}")
+                continue
+            if "/download" in low:
+                if low.endswith("/download"):
+                    candidates.append(f"{b}?id={fid}")
+                elif low.endswith("/download/"):
+                    candidates.append(f"{b.rstrip('/')}?id={fid}")
+                else:
+                    candidates.append(f"{b}?id={fid}")
+                continue
+
+            # If base already ends with /id or contains /id/ path, normalize to /id/{file_id}
+            if low.endswith("/id"):
+                candidates.append(f"{b}/" + fid)
+                continue
+            if "/id/" in low:
+                if low.endswith("/id/"):
+                    candidates.append(f"{b}{fid}")
+                else:
+                    parts = b.split("/id/")
+                    if len(parts) >= 2 and parts[-1]:
+                        candidates.append(b)
+                    else:
+                        candidates.append(f"{b.rstrip('/')}/{fid}")
+                continue
+
+            # Default NEW fallback: /id/{file_id}
+            candidates.append(f"{b}/id/{fid}")
+
+        # Deduplicate while preserving order
+        seen = set()
+        out = []
+        for c in candidates:
+            if c and c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
 
     async def _upload_remote_file(self, upload_server: str, download_url: str, filename: str, path: Optional[str] = None) -> dict:
         """Upload remote file to VikingFile using direct API with streaming response."""
         try:
             from aiohttp import FormData
 
-            # Prepare form data (multipart/form-data)
+            if not filename:
+                filename = "video.mp4"
+
             form_data = FormData()
             form_data.add_field('link', download_url)
             form_data.add_field('user', self.user_hash)  # Empty for anonymous
@@ -166,7 +215,6 @@ class VikingFile:
                         error_text = await resp.text()
                         raise Exception(f"VikingFile HTTP {resp.status}: {error_text[:100]}")
 
-                    # Read streaming response
                     final_result = None
                     async for line in resp.content:
                         line_str = line.decode('utf-8').strip()
@@ -176,19 +224,21 @@ class VikingFile:
                                 data = json.loads(line_str)
 
                                 if 'progress' in data:
-                                    # Log only at major milestones
                                     progress_str = data.get('progress', '0%')
-                                    progress_percent = float(progress_str.rstrip('%'))
-                                    milestones = [25, 50, 75, 100]
-                                    if any(abs(progress_percent - milestone) < 0.1 for milestone in milestones):
-                                        logger.info(f"📊 VikingFile: {progress_str} complete")
+                                    try:
+                                        progress_percent = float(str(progress_str).rstrip('%'))
+                                        milestones = [25, 50, 75, 100]
+                                        if any(abs(progress_percent - milestone) < 0.1 for milestone in milestones):
+                                            logger.info(f"📊 VikingFile: {progress_str} complete")
+                                    except Exception:
+                                        pass
 
                                 elif 'hash' in data and 'url' in data:
                                     final_result = data
                                     logger.info(f"✅ VikingFile: Upload complete - {data.get('hash')}")
 
-                            except json.JSONDecodeError:
-                                pass  # Skip non-JSON lines
+                            except Exception:
+                                pass
 
                     if final_result:
                         return final_result
@@ -211,19 +261,24 @@ class VikingFile:
         filename: Optional[str] = None,
     ) -> str:
         """Upload file using remote URL with priority fallback and return VikingFile hash.
-        
+
         Priority:
         1. Google Photos download URL (if gphotos_id provided)
         2. Worker download URL (fallback)
-        
+
         Note: This is an optional service - no local fallback, fails gracefully
         """
-        
-        # Get upload server first
+
+        if not filename:
+            if file_path:
+                filename = os.path.basename(file_path)
+            else:
+                filename = "video.mp4"
+
         upload_server = await self._get_upload_server()
         if not upload_server:
             raise Exception("Failed to get VikingFile upload server")
-        
+
         # Priority 1: Try Google Photos remote upload
         if gphotos_id:
             try:
@@ -236,27 +291,28 @@ class VikingFile:
                     return file_hash
                 else:
                     logger.warning("⚠️ VikingFile: Google Photos URL failed")
-
-            except Exception as e:
+            except Exception:
                 logger.info(f"⚠️ VikingFile: Google Photos failed, trying worker")
 
-        # Priority 2: Try Worker URL fallback
+        # Priority 2: Try Worker URL fallback (supports /id/{id} + multiple workers)
         if file_id:
-            try:
-                worker_url = self._get_worker_download_url(file_id)
-                if worker_url:
-                    logger.info(f"🔗 VikingFile: Using worker URL...")
+            candidates = self._get_worker_url_candidates(file_id)
+            if not candidates:
+                raise Exception("No worker URLs configured")
+
+            last_err = None
+            for idx, worker_url in enumerate(candidates, start=1):
+                try:
+                    logger.info(f"🔗 VikingFile: Using worker URL ({idx}/{len(candidates)})...")
                     result = await self._upload_remote_file(upload_server, worker_url, filename, path)
                     file_hash = result.get('hash')
                     logger.info(f"✅ VikingFile: Success (worker) - {file_hash}")
                     return file_hash
-                else:
-                    raise Exception("No worker URLs configured")
+                except Exception as e:
+                    last_err = e
+                    logger.warning(f"⚠️ VikingFile: Worker attempt failed ({idx}/{len(candidates)}): {str(e)[:160]}")
+                    continue
 
-            except Exception as e:
-                logger.error(f"❌ VikingFile: Worker upload failed - {str(e)}")
-                raise Exception(f"VikingFile upload failed: {str(e)}")
-        else:
-            raise Exception("No file_id provided for worker fallback")
+            raise Exception(f"VikingFile upload failed: {str(last_err) if last_err else 'worker failed'}")
 
-
+        raise Exception("No file_id provided for worker fallback")
