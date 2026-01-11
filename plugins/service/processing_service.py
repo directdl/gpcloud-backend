@@ -7,6 +7,7 @@ import requests
 import mimetypes
 import time
 import inspect
+import asyncio
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 from plugins.drive import GoogleDrive
@@ -58,12 +59,18 @@ class ProcessingService:
         self.upload_join_timeout = int(os.getenv("UPLOAD_JOIN_TIMEOUT", "1200"))
         self.viking_join_timeout = int(os.getenv("VIKING_JOIN_TIMEOUT", "1200"))
 
+        self._results_lock = threading.Lock()
+
     def _create_task_queue(self) -> "Queue[TaskArgs]":
         if TYPE_CHECKING:
             from queue import Queue
             return Queue()
         import queue
         return queue.Queue()
+
+    def _set_result(self, upload_results: Dict[str, str], key: str, value: Any) -> None:
+        with self._results_lock:
+            upload_results[key] = "" if value is None else str(value)
 
     def _safe_db_update(self, token: str, is_reupload: bool, **fields: Any) -> bool:
         update_method = self.db.reupload_link if is_reupload else self.db.update_link
@@ -93,6 +100,9 @@ class ProcessingService:
                     "buzzheavier_id": ["buzzheavier_id", "buzzheavier"],
                     "viking_id": ["viking_id", "viking"],
                     "filetype": ["filetype", "mime", "mime_type"],
+                    "gphotos_id": ["gphotos_id", "media_key", "mediaId", "media_key_id"],
+                    "gp_id": ["gp_id", "gpid"],
+                    "media_key": ["media_key", "gphotos_id"],
                 }
                 for k, v in fields.items():
                     if k in alias_map:
@@ -126,10 +136,20 @@ class ProcessingService:
         self.logger.process_start(proc_label, token)
         start_ms = _now_ms()
 
+        upload_results: dict[str, str] = {}
+        local_path: Optional[str] = None
+        filename: str = ""
+        filesize: Any = None
+
         try:
             with self.queue_lock:
                 self.active_tasks += 1
                 self.pending_tasks.add(token)
+
+            self.logger.info(
+                f"🧾 Job start | token={token} | is_reupload={is_reupload} | file_id={file_id} | "
+                f"active={self.active_tasks}"
+            )
 
             drive = GoogleDrive()
 
@@ -142,21 +162,32 @@ class ProcessingService:
                         "filetype": link_data.get("filetype", ""),
                         "file_id": file_id,
                     }
-                    self.logger.info(f"ℹ️ Using existing file info | token={token} | filename={file_info.get('filename')}")
+                    self.logger.info(
+                        f"ℹ️ Using existing file info | token={token} | filename={file_info.get('filename')} | "
+                        f"filetype={file_info.get('filetype')}"
+                    )
                 else:
                     self.logger.warning(f"⚠️ No DB record for token={token}. Fetching file info from Drive.")
                     file_info = drive.get_file_info(file_id)
 
             local_path, filename, filesize = drive.download_file(file_id, token, file_info=file_info, job_type="process_file")
-            self.logger.info(f"⬇️ Downloaded | token={token} | file={filename} | size={filesize} | path={local_path}")
+            self.logger.info(
+                f"⬇️ Downloaded | token={token} | file={filename} | size={filesize} | path={local_path}"
+            )
 
             detected_type = (file_info or {}).get("filetype") or _detect_filetype(filename)
             if detected_type:
                 self._safe_db_update(token, is_reupload, filetype=detected_type)
                 self._safe_mysql_instant_update(token, filetype=detected_type)
+                self.logger.info(f"🧩 Filetype resolved | token={token} | filetype={detected_type}")
+            else:
+                self.logger.warning(f"⚠️ Filetype empty | token={token} | file={filename}")
 
             enable_gphotos = os.getenv("ENABLE_GPHOTOS", "true").lower() == "true"
-            self.logger.info(f"⚙️ Upload settings | ENABLE_GPHOTOS={enable_gphotos} | join_timeout={self.upload_join_timeout}s")
+            self.logger.info(
+                f"⚙️ Upload settings | token={token} | ENABLE_GPHOTOS={enable_gphotos} | "
+                f"join_timeout={self.upload_join_timeout}s | viking_timeout={self.viking_join_timeout}s"
+            )
 
             viking_uploader = None
             pixeldrain_uploader = None
@@ -164,31 +195,40 @@ class ProcessingService:
             other_uploaders = []
 
             for uploader in get_enabled_uploaders():
-                if uploader.name == "VIKINGFILE":
+                up_name = (getattr(uploader, "name", "") or "").upper()
+                if up_name == "VIKINGFILE":
                     viking_uploader = uploader
                     continue
                 id_field = getattr(uploader, "id_field", "") or ""
-                uname = (uploader.name or "").upper()
-                if id_field == "pixeldrain_id" or "PIXELDRAIN" in uname:
+                if id_field == "pixeldrain_id" or "PIXELDRAIN" in up_name:
                     pixeldrain_uploader = uploader
-                elif id_field == "buzzheavier_id" or "BUZZ" in uname:
+                elif id_field == "buzzheavier_id" or "BUZZ" in up_name:
                     buzz_uploader = uploader
                 else:
                     other_uploaders.append(uploader)
 
-            upload_results: dict[str, str] = {}
+            self.logger.info(
+                f"🧱 Upload plan | token={token} | gphotos={enable_gphotos} | "
+                f"pixeldrain={bool(pixeldrain_uploader)} | buzz={bool(buzz_uploader)} | "
+                f"others={len(other_uploaders)} | viking={bool(viking_uploader)}"
+            )
 
             if enable_gphotos:
                 self.logger.info(f"🚀 Step-1: Google Photos upload start | token={token}")
-                self._upload_gphotos(local_path, token, is_reupload, upload_results, db_filetype=detected_type)
-                self.logger.info(f"✅ Step-1 done | token={token} | gphotos_id_set={bool(upload_results.get('gphotos_id'))}")
+                self._upload_gphotos(local_path, token, is_reupload, upload_results)
+                self.logger.info(
+                    f"✅ Step-1 done | token={token} | gphotos_id_set={bool(upload_results.get('gphotos_id'))} | "
+                    f"skipped={bool(upload_results.get('gphotos_skipped'))}"
+                )
             else:
                 self.logger.info("⏭️ Step-1 skipped | Google Photos disabled")
 
             if pixeldrain_uploader:
                 self.logger.info(f"🚀 Step-2: PixelDrain upload start | token={token}")
                 self._run_uploader_blocking(pixeldrain_uploader, local_path, token, is_reupload, upload_results)
-                self.logger.info(f"✅ Step-2 done | token={token} | pixeldrain_id_set={bool(upload_results.get('pixeldrain_id'))}")
+                self.logger.info(
+                    f"✅ Step-2 done | token={token} | pixeldrain_id_set={bool(upload_results.get('pixeldrain_id'))}"
+                )
             else:
                 self.logger.info("⏭️ Step-2 skipped | PixelDrain uploader not enabled")
 
@@ -200,23 +240,37 @@ class ProcessingService:
             if parallel_uploaders:
                 self.logger.info(f"🚀 Step-3: Parallel upload start | count={len(parallel_uploaders)} | token={token}")
                 threads: list[threading.Thread] = []
+                started = _now_ms()
+
                 for uploader in parallel_uploaders:
-                    t = threading.Thread(target=self._make_upload_runner(uploader, local_path, token, is_reupload, upload_results))
+                    up_name = getattr(uploader, "name", "UPLOADER")
+                    t = threading.Thread(
+                        target=self._make_upload_runner(uploader, local_path, token, is_reupload, upload_results),
+                        name=f"uploader:{up_name}:{token[:6]}",
+                    )
                     t.daemon = True
                     t.start()
                     threads.append(t)
+
                 for t in threads:
                     t.join(timeout=self.upload_join_timeout)
-                alive = [t for t in threads if t.is_alive()]
+
+                alive = [t.name for t in threads if t.is_alive()]
+                took = (_now_ms() - started) / 1000.0
                 if alive:
-                    self.logger.warning(f"⏳ Step-3: uploads still running after timeout | alive={len(alive)} | token={token}")
-                self.logger.info(f"✅ Step-3 done | token={token}")
+                    self.logger.warning(
+                        f"⏳ Step-3 timeout | token={token} | alive={len(alive)} | seconds={took:.2f} | threads={alive}"
+                    )
+                self.logger.info(f"✅ Step-3 done | token={token} | seconds={took:.2f}")
             else:
                 self.logger.info("⏭️ Step-3 skipped | No other uploaders enabled")
 
             if viking_uploader:
                 self.logger.info(f"🔄 Step-4: VikingFile upload start (last) | token={token}")
-                t_vk = threading.Thread(target=self._make_upload_runner(viking_uploader, local_path, token, is_reupload, upload_results))
+                t_vk = threading.Thread(
+                    target=self._make_upload_runner(viking_uploader, local_path, token, is_reupload, upload_results),
+                    name=f"uploader:VIKINGFILE:{token[:6]}",
+                )
                 t_vk.daemon = True
                 t_vk.start()
                 t_vk.join(timeout=self.viking_join_timeout)
@@ -262,23 +316,48 @@ class ProcessingService:
             self._update_status_success(token, file_id)
 
             took = (_now_ms() - start_ms) / 1000.0
-            self.logger.info(f"🏁 Done | token={token} | seconds={took:.2f}")
+            self.logger.info(
+                f"🏁 Done | token={token} | seconds={took:.2f} | "
+                f"gphotos={'YES' if (upload_results.get('gphotos_id') or link_doc.get('gphotos_id')) else ('SKIP' if upload_results.get('gphotos_skipped') else 'NO')} | "
+                f"pixeldrain={'YES' if (upload_results.get('pixeldrain_id') or link_doc.get('pixeldrain_id')) else 'NO'} | "
+                f"viking={'YES' if (upload_results.get('viking_id') or link_doc.get('viking_id')) else 'NO'}"
+            )
 
         except Exception as error:
             self._handle_processing_error(token, file_id, error, is_reupload)
         finally:
-            self.pending_tasks.discard(token)
-            self._schedule_next_task()
-            self._cleanup_download(token)
+            try:
+                self.pending_tasks.discard(token)
+                self._schedule_next_task()
+            finally:
+                try:
+                    self._cleanup_download(token)
+                except Exception:
+                    pass
 
     def _run_uploader_blocking(self, uploader, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str]) -> None:
         runner = self._make_upload_runner(uploader, local_path, token, is_reupload, upload_results)
         runner()
 
+    def _maybe_await(self, value: Any) -> Any:
+        if inspect.isawaitable(value):
+            try:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop and loop.is_running():
+                    return asyncio.run_coroutine_threadsafe(value, loop).result(timeout=self.upload_join_timeout)
+                return asyncio.run(value)
+            except Exception:
+                return value
+        return value
+
     def _make_upload_runner(self, uploader, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str]):
         def runner() -> None:
             up_name = getattr(uploader, "name", "UPLOADER")
             started = _now_ms()
+
             try:
                 if up_name == "VIKINGFILE":
                     link_data = self.db.get_link(token) or {}
@@ -295,24 +374,29 @@ class ProcessingService:
 
                     self.logger.upload_start("VikingFile", filename)
 
-                    file_id_value = uploader.upload(
+                    res = uploader.upload(
                         local_path,
                         token=token,
                         gphotos_id=gphotos_raw,
                         file_id=drive_file_id,
                         filename=filename,
                     )
+                    file_id_value = self._maybe_await(res)
                     db_field = "viking_id"
                 else:
                     filename = os.path.basename(local_path)
                     self.logger.upload_start(up_name, filename)
-                    file_id_value = uploader.upload(local_path, token)
+
+                    res = uploader.upload(local_path, token)
+                    file_id_value = self._maybe_await(res)
+
                     db_field = getattr(uploader, "id_field", "") or ""
                     if not db_field:
-                        db_field = f"{up_name.lower()}_id"
+                        db_field = f"{str(up_name).lower()}_id"
 
                 file_id_value = "" if file_id_value is None else str(file_id_value).strip()
-                upload_results[db_field] = file_id_value
+                self._set_result(upload_results, db_field, file_id_value)
+
                 if not file_id_value:
                     raise Exception(f"{up_name} returned empty id for field={db_field}")
 
@@ -324,7 +408,10 @@ class ProcessingService:
                     self.logger.upload_success("VikingFile", file_id_value)
                 else:
                     self.logger.upload_success(up_name, file_id_value)
-                self.logger.info(f"✅ Upload done | {up_name} | token={token} | field={db_field} | seconds={took:.2f}")
+
+                self.logger.info(
+                    f"✅ Upload done | {up_name} | token={token} | field={db_field} | id={file_id_value} | seconds={took:.2f}"
+                )
 
             except Exception as exc:
                 msg = str(exc)
@@ -333,16 +420,31 @@ class ProcessingService:
                     self.logger.upload_failed("VikingFile (optional)", msg)
                 else:
                     self.logger.upload_failed(up_name, msg)
-                upload_results[f"{up_name.lower()}_error"] = msg
+
+                self._set_result(upload_results, f"{str(up_name).lower()}_error", msg)
                 self.logger.error(f"❌ Upload failed | {up_name} | token={token} | seconds={took:.2f} | err={msg}")
+
         return runner
 
-    def _upload_gphotos(self, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str], db_filetype: Optional[str] = None) -> None:
+    def _upload_gphotos(self, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str]) -> None:
         started = _now_ms()
         try:
             gphotos = GPhotos()
-            self.logger.upload_start("Google Photos", os.path.basename(local_path))
-            gphotos_id = gphotos.upload(local_path, token=token, db_filetype=db_filetype)
+            filename = os.path.basename(local_path)
+
+            link_data = self.db.get_link(token) or {}
+            db_filetype = (link_data.get("filetype") or "").strip()
+
+            if not gphotos.is_video_file(local_path, db_filetype=db_filetype):
+                self.logger.info(
+                    f"⏭️ Google Photos skipped (non-video) | token={token} | filetype={db_filetype or 'unknown'} | file={filename}"
+                )
+                self._set_result(upload_results, "gphotos_skipped", db_filetype or "non-video")
+                return
+
+            self.logger.upload_start("Google Photos", filename)
+
+            gphotos_id = gphotos.upload(local_path, token, db_filetype=db_filetype)
             if not gphotos_id:
                 raise Exception("Google Photos returned empty id")
 
@@ -365,9 +467,9 @@ class ProcessingService:
                 **({"gp_id": encrypted_gp_id} if encrypted_gp_id else {}),
             )
 
-            upload_results["gphotos_id"] = encrypted_id
+            self._set_result(upload_results, "gphotos_id", encrypted_id)
             if encrypted_gp_id:
-                upload_results["gp_id"] = encrypted_gp_id
+                self._set_result(upload_results, "gp_id", encrypted_gp_id)
 
             self.logger.upload_success("Google Photos", gphotos_id)
             took = (_now_ms() - started) / 1000.0
@@ -377,7 +479,7 @@ class ProcessingService:
             msg = str(exc)
             took = (_now_ms() - started) / 1000.0
             self.logger.upload_failed("Google Photos", msg)
-            upload_results["gphotos_error"] = msg
+            self._set_result(upload_results, "gphotos_error", msg)
             self.logger.error(f"❌ Google Photos failed | token={token} | seconds={took:.2f} | err={msg}")
 
     def _update_status_success(self, token: str, file_id: str) -> None:
@@ -442,7 +544,10 @@ class ProcessingService:
                 self.active_tasks = max(0, self.active_tasks)
                 return
             next_task = self.task_queue.get()
-            thread = threading.Thread(target=self.process_file, args=next_task)
+            self.logger.info(
+                f"➡️ Scheduling next queued task | token={next_task[0]} | active={self.active_tasks} | queued={self.task_queue.qsize()}"
+            )
+            thread = threading.Thread(target=self.process_file, args=next_task, name=f"process:{next_task[0][:6]}")
             thread.daemon = True
             thread.start()
 
@@ -463,8 +568,12 @@ class ProcessingService:
     def enqueue_local_fallback(self, task: TaskArgs) -> None:
         with self.queue_lock:
             if self.active_tasks <= 0:
-                thread = threading.Thread(target=self.process_file, args=task)
+                self.logger.info(f"▶️ Starting task immediately | token={task[0]} | active={self.active_tasks}")
+                thread = threading.Thread(target=self.process_file, args=task, name=f"process:{task[0][:6]}")
                 thread.daemon = True
                 thread.start()
             else:
                 self.task_queue.put(task)
+                self.logger.info(
+                    f"🧾 Queued task | token={task[0]} | active={self.active_tasks} | queued={self.task_queue.qsize()}"
+                )
