@@ -180,7 +180,7 @@ class ProcessingService:
 
             if enable_gphotos:
                 self.logger.info(f"🚀 Step-1: Google Photos upload start | token={token}")
-                self._upload_gphotos(local_path, token, is_reupload, upload_results)
+                self._upload_gphotos(local_path, token, is_reupload, upload_results, db_filetype=detected_type)
                 self.logger.info(f"✅ Step-1 done | token={token} | gphotos_id_set={bool(upload_results.get('gphotos_id'))}")
             else:
                 self.logger.info("⏭️ Step-1 skipped | Google Photos disabled")
@@ -337,12 +337,12 @@ class ProcessingService:
                 self.logger.error(f"❌ Upload failed | {up_name} | token={token} | seconds={took:.2f} | err={msg}")
         return runner
 
-    def _upload_gphotos(self, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str]) -> None:
+    def _upload_gphotos(self, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str], db_filetype: Optional[str] = None) -> None:
         started = _now_ms()
         try:
             gphotos = GPhotos()
             self.logger.upload_start("Google Photos", os.path.basename(local_path))
-            gphotos_id = gphotos.upload(local_path, token)
+            gphotos_id = gphotos.upload(local_path, token=token, db_filetype=db_filetype)
             if not gphotos_id:
                 raise Exception("Google Photos returned empty id")
 
