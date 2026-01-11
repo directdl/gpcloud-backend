@@ -601,13 +601,10 @@ class GoogleDrive:
         
         # Helper function to build download URL from base URL
         def build_download_url(base_url):
-            if base_url.endswith('/'):
-                base_url = base_url.rstrip('/')
-            
-            if 'download.aspx' in base_url or '/download' in base_url:
-                return f"{base_url}?id={file_id}"
-            else:
-                return f"{base_url}/download.aspx?id={file_id}"
+            base_url = (base_url or "").strip().rstrip("/")
+            if not base_url:
+                raise Exception("Empty worker base URL")
+            return f"{base_url}/id/{file_id}"
         
         # Try with random worker URLs - total 3 attempts (1 initial + 2 retries)
         for attempt in range(max_retries + 1):  # 0 = initial, 1 = first retry, 2 = second retry
