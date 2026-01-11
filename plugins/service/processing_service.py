@@ -46,23 +46,13 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _short_id(val: Any, keep: int = 6) -> str:
-    s = "" if val is None else str(val)
-    s = s.strip()
-    if not s:
-        return ""
-    if len(s) <= keep * 2 + 3:
-        return s
-    return f"{s[:keep]}...{s[-keep:]}"
-
-
 def _is_video_mime(mime: str) -> bool:
-    m = (mime or "").strip().lower()
+    m = (mime or "").lower().strip()
     if not m:
         return False
     if m.startswith("video/"):
         return True
-    if m in ("video/x-matroska", "application/x-matroska"):
+    if "matroska" in m or "mkv" in m:
         return True
     return False
 
@@ -80,7 +70,9 @@ class ProcessingService:
         self.upload_join_timeout = int(os.getenv("UPLOAD_JOIN_TIMEOUT", "1200"))
         self.viking_join_timeout = int(os.getenv("VIKING_JOIN_TIMEOUT", "1200"))
 
-        self.downloads_dir = os.getenv("DOWNLOADS_DIR", os.path.join(os.getcwd(), "downloads"))
+        self.reupload_clear_old = os.getenv("REUPLOAD_CLEAR_OLD", "true").lower() == "true"
+        self.reupload_require_fresh = os.getenv("REUPLOAD_REQUIRE_FRESH", "true").lower() == "true"
+
         self._results_lock = threading.Lock()
 
     def _create_task_queue(self) -> "Queue[TaskArgs]":
@@ -89,6 +81,12 @@ class ProcessingService:
             return Queue()
         import queue
         return queue.Queue()
+
+    def _kv(self, **kv: Any) -> str:
+        parts = []
+        for k, v in kv.items():
+            parts.append(f"{k}={v}")
+        return " | ".join(parts)
 
     def _set_result(self, upload_results: Dict[str, str], key: str, value: Any) -> None:
         with self._results_lock:
@@ -153,45 +151,22 @@ class ProcessingService:
             self.logger.error(f"❌ MySQL instant update failed | token={token} | fields={fields} | err={exc}")
             return False
 
-    def _clear_provider_fields_for_reupload(self, token: str, enable_gphotos: bool, has_pixeldrain: bool, has_buzz: bool, has_viking: bool) -> Dict[str, str]:
-        old_doc = self.db.get_link(token) or {}
-        old = {
-            "gphotos_id": str(old_doc.get("gphotos_id") or "").strip(),
-            "gp_id": str(old_doc.get("gp_id") or "").strip(),
-            "pixeldrain_id": str(old_doc.get("pixeldrain_id") or "").strip(),
-            "buzzheavier_id": str(old_doc.get("buzzheavier_id") or "").strip(),
-            "viking_id": str(old_doc.get("viking_id") or "").strip(),
+    def _clear_old_provider_fields(self, token: str) -> None:
+        if not self.reupload_clear_old:
+            return
+        fields = {
+            "pixeldrain_id": None,
+            "buzzheavier_id": None,
+            "viking_id": None,
+            "gphotos_id": None,
+            "gp_id": None,
         }
-
-        self.logger.info(
-            "♻️ Reupload pre-snapshot | token=%s | old_gphotos=%s | old_pix=%s | old_buzz=%s | old_viking=%s",
-            token,
-            _short_id(old["gphotos_id"]),
-            _short_id(old["pixeldrain_id"]),
-            _short_id(old["buzzheavier_id"]),
-            _short_id(old["viking_id"]),
-        )
-
-        clear_fields: Dict[str, Any] = {}
-        if enable_gphotos:
-            clear_fields["gphotos_id"] = ""
-            clear_fields["gp_id"] = ""
-        if has_pixeldrain:
-            clear_fields["pixeldrain_id"] = ""
-        if has_buzz:
-            clear_fields["buzzheavier_id"] = ""
-        if has_viking:
-            clear_fields["viking_id"] = ""
-
-        if clear_fields:
-            self.logger.info(f"🧽 Reupload clearing provider fields | token={token} | fields={list(clear_fields.keys())}")
-            self._safe_db_update(token, True, **clear_fields)
-            mysql_clear = dict(clear_fields)
-            if "gphotos_id" in mysql_clear:
-                mysql_clear["media_key"] = ""
-            self._safe_mysql_instant_update(token, **mysql_clear)
-
-        return old
+        self.logger.info(f"🧽 Reupload pre-clean enabled | token={token} | clearing provider ids")
+        self._safe_db_update(token, True, **fields)
+        try:
+            self._safe_mysql_instant_update(token, **fields)
+        except Exception:
+            pass
 
     def process_file(self, token: str, file_id: str, file_info: Optional[Dict[str, Any]], is_reupload: bool = False) -> None:
         proc_label = "Reupload Process" if is_reupload else "File Process"
@@ -202,15 +177,22 @@ class ProcessingService:
         local_path: Optional[str] = None
         filename: str = ""
         filesize: Any = None
-        detected_type: str = ""
-        old_provider_ids: Dict[str, str] = {}
+
+        prev_doc: Dict[str, Any] = {}
+        try:
+            prev_doc = self.db.get_link(token) or {}
+        except Exception:
+            prev_doc = {}
 
         try:
             with self.queue_lock:
                 self.active_tasks += 1
                 self.pending_tasks.add(token)
 
-            self.logger.info(f"🧾 Job start | token={token} | is_reupload={is_reupload} | file_id={file_id} | active={self.active_tasks}")
+            self.logger.info(f"🧾 Job start | {self._kv(token=token, is_reupload=is_reupload, file_id=file_id, active=self.active_tasks)}")
+
+            if is_reupload:
+                self._clear_old_provider_fields(token)
 
             drive = GoogleDrive()
 
@@ -224,24 +206,29 @@ class ProcessingService:
                         "file_id": file_id,
                     }
                     self.logger.info(
-                        f"ℹ️ Using existing file info | token={token} | filename={file_info.get('filename')} | filetype={file_info.get('filetype')}"
+                        f"ℹ️ Using existing file info | {self._kv(token=token, filename=file_info.get('filename'), filetype=file_info.get('filetype'))}"
                     )
                 else:
-                    self.logger.warning(f"⚠️ No DB record for token={token}. Fetching file info from Drive.")
+                    self.logger.warning(f"⚠️ No DB record | token={token} | falling back to Drive metadata")
                     file_info = drive.get_file_info(file_id)
 
             local_path, filename, filesize = drive.download_file(file_id, token, file_info=file_info, job_type="process_file")
-            self.logger.info(f"⬇️ Downloaded | token={token} | file={filename} | size={filesize} | path={local_path}")
+            self.logger.info(f"⬇️ Downloaded | {self._kv(token=token, file=filename, size=filesize, path=local_path)}")
 
-            detected_type = str((file_info or {}).get("filetype") or "").strip() or _detect_filetype(filename)
+            detected_type = (file_info or {}).get("filetype") or _detect_filetype(filename)
+            detected_type = str(detected_type or "").strip()
             if detected_type:
                 self._safe_db_update(token, is_reupload, filetype=detected_type)
                 self._safe_mysql_instant_update(token, filetype=detected_type)
-                self.logger.info(f"🧩 Filetype resolved | token={token} | filetype={detected_type}")
+                self.logger.info(f"🧩 Filetype resolved | {self._kv(token=token, filetype=detected_type)}")
             else:
-                self.logger.warning(f"⚠️ Filetype empty | token={token} | file={filename}")
+                self.logger.warning(f"⚠️ Filetype empty | {self._kv(token=token, file=filename)}")
 
             enable_gphotos = os.getenv("ENABLE_GPHOTOS", "true").lower() == "true"
+            gphotos_required = enable_gphotos and _is_video_mime(detected_type)
+            self.logger.info(
+                f"⚙️ Upload settings | {self._kv(token=token, ENABLE_GPHOTOS=enable_gphotos, gphotos_required=gphotos_required, join_timeout=self.upload_join_timeout, viking_timeout=self.viking_join_timeout)}"
+            )
 
             viking_uploader = None
             pixeldrain_uploader = None
@@ -262,36 +249,24 @@ class ProcessingService:
                     other_uploaders.append(uploader)
 
             self.logger.info(
-                f"⚙️ Upload settings | token={token} | ENABLE_GPHOTOS={enable_gphotos} | join_timeout={self.upload_join_timeout}s | viking_timeout={self.viking_join_timeout}s"
+                f"🧱 Upload plan | {self._kv(token=token, gphotos=enable_gphotos, pixeldrain=bool(pixeldrain_uploader), buzz=bool(buzz_uploader), others=len(other_uploaders), viking=bool(viking_uploader))}"
             )
-            self.logger.info(
-                f"🧱 Upload plan | token={token} | gphotos={enable_gphotos} | pixeldrain={bool(pixeldrain_uploader)} | buzz={bool(buzz_uploader)} | others={len(other_uploaders)} | viking={bool(viking_uploader)}"
-            )
-
-            if is_reupload:
-                old_provider_ids = self._clear_provider_fields_for_reupload(
-                    token=token,
-                    enable_gphotos=enable_gphotos,
-                    has_pixeldrain=bool(pixeldrain_uploader),
-                    has_buzz=bool(buzz_uploader),
-                    has_viking=bool(viking_uploader),
-                )
 
             if enable_gphotos:
                 self.logger.info(f"🚀 Step-1: Google Photos upload start | token={token}")
                 self._upload_gphotos(local_path, token, is_reupload, upload_results, detected_type=detected_type)
                 self.logger.info(
-                    f"✅ Step-1 done | token={token} | gphotos_id_set={bool(upload_results.get('gphotos_id'))} | skipped={bool(upload_results.get('gphotos_skipped'))}"
+                    f"✅ Step-1 done | {self._kv(token=token, gphotos_id_set=bool(upload_results.get('gphotos_id')), skipped=bool(upload_results.get('gphotos_skipped')))}"
                 )
             else:
-                self.logger.info("⏭️ Step-1 skipped | Google Photos disabled")
+                self.logger.info(f"⏭️ Step-1 skipped | token={token} | reason=Google Photos disabled")
 
             if pixeldrain_uploader:
                 self.logger.info(f"🚀 Step-2: PixelDrain upload start | token={token}")
-                self._run_uploader_blocking(pixeldrain_uploader, local_path, token, is_reupload, upload_results, drive_file_id=file_id)
-                self.logger.info(f"✅ Step-2 done | token={token} | pixeldrain_id_set={bool(upload_results.get('pixeldrain_id'))}")
+                self._run_uploader_blocking(pixeldrain_uploader, local_path, token, is_reupload, upload_results, prev_doc=prev_doc)
+                self.logger.info(f"✅ Step-2 done | {self._kv(token=token, pixeldrain_id_set=bool(upload_results.get('pixeldrain_id')))}")
             else:
-                self.logger.info("⏭️ Step-2 skipped | PixelDrain uploader not enabled")
+                self.logger.info(f"⏭️ Step-2 skipped | token={token} | reason=PixelDrain disabled")
 
             parallel_uploaders = []
             if buzz_uploader:
@@ -299,14 +274,14 @@ class ProcessingService:
             parallel_uploaders.extend(other_uploaders)
 
             if parallel_uploaders:
-                self.logger.info(f"🚀 Step-3: Parallel upload start | count={len(parallel_uploaders)} | token={token}")
+                self.logger.info(f"🚀 Step-3: Parallel upload start | {self._kv(token=token, count=len(parallel_uploaders))}")
                 threads: list[threading.Thread] = []
                 started = _now_ms()
 
                 for uploader in parallel_uploaders:
                     up_name = getattr(uploader, "name", "UPLOADER")
                     t = threading.Thread(
-                        target=self._make_upload_runner(uploader, local_path, token, is_reupload, upload_results, drive_file_id=file_id),
+                        target=self._make_upload_runner(uploader, local_path, token, is_reupload, upload_results, prev_doc=prev_doc),
                         name=f"uploader:{up_name}:{token[:6]}",
                     )
                     t.daemon = True
@@ -319,15 +294,16 @@ class ProcessingService:
                 alive = [t.name for t in threads if t.is_alive()]
                 took = (_now_ms() - started) / 1000.0
                 if alive:
-                    self.logger.warning(f"⏳ Step-3 timeout | token={token} | alive={len(alive)} | seconds={took:.2f} | threads={alive}")
-                self.logger.info(f"✅ Step-3 done | token={token} | seconds={took:.2f}")
+                    self.logger.warning(f"⏳ Step-3 timeout | {self._kv(token=token, alive=len(alive), seconds=f'{took:.2f}', threads=alive)}")
+                self.logger.info(f"✅ Step-3 done | {self._kv(token=token, seconds=f'{took:.2f}')}")
+
             else:
-                self.logger.info("⏭️ Step-3 skipped | No other uploaders enabled")
+                self.logger.info(f"⏭️ Step-3 skipped | token={token} | reason=no other uploaders")
 
             if viking_uploader:
                 self.logger.info(f"🔄 Step-4: VikingFile upload start (last) | token={token}")
                 t_vk = threading.Thread(
-                    target=self._make_upload_runner(viking_uploader, local_path, token, is_reupload, upload_results, drive_file_id=file_id),
+                    target=self._make_upload_runner(viking_uploader, local_path, token, is_reupload, upload_results, prev_doc=prev_doc),
                     name=f"uploader:VIKINGFILE:{token[:6]}",
                 )
                 t_vk.daemon = True
@@ -338,60 +314,38 @@ class ProcessingService:
                 else:
                     self.logger.info(f"✅ Step-4 done | token={token}")
             else:
-                self.logger.info("⏭️ Step-4 skipped | Viking uploader not enabled")
+                self.logger.info(f"⏭️ Step-4 skipped | token={token} | reason=Viking disabled")
 
             link_doc = self.db.get_link(token) or {}
 
-            if is_reupload:
-                self.logger.info(
-                    "🔎 Reupload post-snapshot | token=%s | new_gphotos=%s | new_pix=%s | new_buzz=%s | new_viking=%s",
-                    token,
-                    _short_id(link_doc.get("gphotos_id")),
-                    _short_id(link_doc.get("pixeldrain_id")),
-                    _short_id(link_doc.get("buzzheavier_id")),
-                    _short_id(link_doc.get("viking_id")),
-                )
-
-                def _cmp(name: str, newv: Any) -> None:
-                    oldv = old_provider_ids.get(name, "")
-                    newv_s = str(newv or "").strip()
-                    if not newv_s:
-                        self.logger.info(f"🧾 Reupload compare | token={token} | {name}=EMPTY | old={_short_id(oldv)}")
-                        return
-                    if oldv and newv_s == oldv:
-                        self.logger.info(f"🧾 Reupload compare | token={token} | {name}=SAME (DEDUP/ALREADY) | id={_short_id(newv_s)}")
-                    else:
-                        self.logger.info(f"🧾 Reupload compare | token={token} | {name}=CHANGED | old={_short_id(oldv)} | new={_short_id(newv_s)}")
-
-                _cmp("gphotos_id", link_doc.get("gphotos_id"))
-                _cmp("pixeldrain_id", link_doc.get("pixeldrain_id"))
-                _cmp("buzzheavier_id", link_doc.get("buzzheavier_id"))
-                _cmp("viking_id", link_doc.get("viking_id"))
-
             self.logger.info(
-                f"📌 Final snapshot | token={token} | db_pixeldrain={bool(link_doc.get('pixeldrain_id'))} | db_buzz={bool(link_doc.get('buzzheavier_id'))} | db_viking={bool(link_doc.get('viking_id'))} | db_gphotos={bool(link_doc.get('gphotos_id'))}"
+                f"📌 Final snapshot | {self._kv(token=token, db_pixeldrain=bool(link_doc.get('pixeldrain_id')), db_buzz=bool(link_doc.get('buzzheavier_id')), db_viking=bool(link_doc.get('viking_id')), db_gphotos=bool(link_doc.get('gphotos_id')))}"
             )
-            self.logger.info(f"📌 Upload results keys | token={token} | keys={list(upload_results.keys())}")
+            self.logger.info(f"📌 Upload results keys | {self._kv(token=token, keys=list(upload_results.keys()))}")
 
             required_fields: list[str] = []
-            gphotos_required = enable_gphotos and _is_video_mime(detected_type)
             if gphotos_required:
                 required_fields.append("gphotos_id")
             if pixeldrain_uploader:
                 required_fields.append("pixeldrain_id")
             if buzz_uploader:
                 required_fields.append("buzzheavier_id")
+            if viking_uploader:
+                required_fields.append("viking_id")
 
             if required_fields:
-                if is_reupload:
-                    has_provider_success = any(upload_results.get(f) for f in required_fields)
+                if is_reupload and self.reupload_require_fresh:
+                    missing = [f for f in required_fields if not (upload_results.get(f) or "").strip()]
+                    if missing:
+                        raise Exception("Reupload incomplete (fresh results missing): " + ", ".join(missing))
+                    has_provider_success = True
                 else:
                     has_provider_success = any((upload_results.get(f) or link_doc.get(f)) for f in required_fields)
             else:
                 has_provider_success = True
 
             if not has_provider_success:
-                raise Exception("All enabled upload services failed (fresh results required): " + ", ".join(required_fields))
+                raise Exception("All enabled upload services failed: " + ", ".join(required_fields))
 
             if is_reupload:
                 self.logger.process_complete("Reupload Process", token)
@@ -403,14 +357,14 @@ class ProcessingService:
             self._update_status_success(token, file_id)
 
             took = (_now_ms() - start_ms) / 1000.0
-            gphotos_state = "NO"
+            gphotos_stat = "NO"
             if upload_results.get("gphotos_skipped"):
-                gphotos_state = "SKIP"
+                gphotos_stat = "SKIP"
             if upload_results.get("gphotos_id") or link_doc.get("gphotos_id"):
-                gphotos_state = "YES"
+                gphotos_stat = "YES"
 
             self.logger.info(
-                f"🏁 Done | token={token} | seconds={took:.2f} | gphotos={gphotos_state} | pixeldrain={'YES' if (upload_results.get('pixeldrain_id') or link_doc.get('pixeldrain_id')) else 'NO'} | viking={'YES' if (upload_results.get('viking_id') or link_doc.get('viking_id')) else 'NO'}"
+                f"🏁 Done | {self._kv(token=token, seconds=f'{took:.2f}', gphotos=gphotos_stat, pixeldrain=('YES' if (upload_results.get('pixeldrain_id') or link_doc.get('pixeldrain_id')) else 'NO'), viking=('YES' if (upload_results.get('viking_id') or link_doc.get('viking_id')) else 'NO'))}"
             )
 
         except Exception as error:
@@ -425,8 +379,8 @@ class ProcessingService:
                 except Exception:
                     pass
 
-    def _run_uploader_blocking(self, uploader, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str], drive_file_id: str) -> None:
-        runner = self._make_upload_runner(uploader, local_path, token, is_reupload, upload_results, drive_file_id=drive_file_id)
+    def _run_uploader_blocking(self, uploader, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str], prev_doc: Optional[Dict[str, Any]] = None) -> None:
+        runner = self._make_upload_runner(uploader, local_path, token, is_reupload, upload_results, prev_doc=prev_doc)
         runner()
 
     def _maybe_await(self, value: Any) -> Any:
@@ -443,22 +397,18 @@ class ProcessingService:
                 return value
         return value
 
-    def _make_upload_runner(self, uploader, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str], drive_file_id: str):
+    def _make_upload_runner(self, uploader, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str], prev_doc: Optional[Dict[str, Any]] = None):
         def runner() -> None:
-            up_name_raw = getattr(uploader, "name", "UPLOADER")
-            up_name = (up_name_raw or "UPLOADER").upper()
+            up_name = getattr(uploader, "name", "UPLOADER")
             started = _now_ms()
 
-            db_field = ""
-            file_id_value = ""
-
             try:
-                filename = os.path.basename(local_path)
-
+                prev = prev_doc or {}
                 if up_name == "VIKINGFILE":
                     link_data = self.db.get_link(token) or {}
-                    gphotos_id = str(link_data.get("gphotos_id") or "").strip()
-                    original_filename = str(link_data.get("filename") or "").strip() or filename
+                    gphotos_id = link_data.get("gphotos_id")
+                    drive_file_id = link_data.get("drive_id")
+                    fname = link_data.get("filename") or os.path.basename(local_path)
 
                     gphotos_raw = gphotos_id
                     if gphotos_id and simple_decrypt is not None:
@@ -467,31 +417,38 @@ class ProcessingService:
                         except Exception:
                             gphotos_raw = gphotos_id
 
-                    self.logger.upload_start("VikingFile", original_filename)
-
+                    self.logger.upload_start("VikingFile", fname)
                     res = uploader.upload(
                         local_path,
                         token=token,
                         gphotos_id=gphotos_raw,
                         file_id=drive_file_id,
-                        filename=original_filename,
+                        filename=fname,
                     )
                     file_id_value = self._maybe_await(res)
                     db_field = "viking_id"
                 else:
-                    self.logger.upload_start(up_name_raw, filename)
+                    fname = os.path.basename(local_path)
+                    self.logger.upload_start(up_name, fname)
+
                     res = uploader.upload(local_path, token)
                     file_id_value = self._maybe_await(res)
 
                     db_field = getattr(uploader, "id_field", "") or ""
                     if not db_field:
-                        db_field = f"{str(up_name_raw).lower()}_id"
+                        db_field = f"{str(up_name).lower()}_id"
 
                 file_id_value = "" if file_id_value is None else str(file_id_value).strip()
                 self._set_result(upload_results, db_field, file_id_value)
 
                 if not file_id_value:
-                    raise Exception(f"{up_name_raw} returned empty id for field={db_field}")
+                    raise Exception(f"{up_name} returned empty id for field={db_field}")
+
+                prev_id = str(prev.get(db_field) or "").strip()
+                if prev_id and prev_id == file_id_value:
+                    self.logger.info(f"♻️ Provider returned same id (dedup or same resource) | {self._kv(token=token, provider=up_name, field=db_field, id=file_id_value)}")
+                else:
+                    self.logger.info(f"🆕 Fresh id set | {self._kv(token=token, provider=up_name, field=db_field, id=file_id_value)}")
 
                 self._safe_db_update(token, is_reupload, **{db_field: file_id_value})
                 self._safe_mysql_instant_update(token, **{db_field: file_id_value})
@@ -500,22 +457,9 @@ class ProcessingService:
                 if up_name == "VIKINGFILE":
                     self.logger.upload_success("VikingFile", file_id_value)
                 else:
-                    self.logger.upload_success(up_name_raw, file_id_value)
+                    self.logger.upload_success(up_name, file_id_value)
 
-                old_doc = self.db.get_link(token) or {}
-                old_val = ""
-                if is_reupload:
-                    old_val = ""
-                else:
-                    old_val = str(old_doc.get(db_field) or "").strip()
-
-                same_hint = ""
-                if old_val and file_id_value == old_val:
-                    same_hint = " | SAME-ID (provider dedup/already)"
-
-                self.logger.info(
-                    f"✅ Upload done | {up_name_raw} | token={token} | field={db_field} | id={file_id_value} | seconds={took:.2f}{same_hint}"
-                )
+                self.logger.info(f"✅ Upload done | {self._kv(token=token, provider=up_name, field=db_field, id=file_id_value, seconds=f'{took:.2f}')}")
 
             except Exception as exc:
                 msg = str(exc)
@@ -523,27 +467,28 @@ class ProcessingService:
                 if up_name == "VIKINGFILE":
                     self.logger.upload_failed("VikingFile (optional)", msg)
                 else:
-                    self.logger.upload_failed(up_name_raw, msg)
+                    self.logger.upload_failed(up_name, msg)
 
-                self._set_result(upload_results, f"{str(up_name_raw).lower()}_error", msg)
-                self.logger.error(f"❌ Upload failed | {up_name_raw} | token={token} | seconds={took:.2f} | err={msg}")
+                self._set_result(upload_results, f"{str(up_name).lower()}_error", msg)
+                self.logger.error(f"❌ Upload failed | {self._kv(token=token, provider=up_name, seconds=f'{took:.2f}', err=msg)}")
 
         return runner
 
-    def _upload_gphotos(self, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str], detected_type: str) -> None:
+    def _upload_gphotos(self, local_path: str, token: str, is_reupload: bool, upload_results: Dict[str, str], detected_type: str = "") -> None:
         started = _now_ms()
         try:
             gphotos = GPhotos()
-            filename = os.path.basename(local_path)
+            fname = os.path.basename(local_path)
 
-            db_filetype = (detected_type or "").strip()
+            link_data = self.db.get_link(token) or {}
+            db_filetype = (link_data.get("filetype") or detected_type or "").strip()
 
             if not gphotos.is_video_file(local_path, db_filetype=db_filetype):
-                self.logger.info(f"⏭️ Google Photos skipped (non-video) | token={token} | filetype={db_filetype or 'unknown'} | file={filename}")
+                self.logger.info(f"⏭️ Google Photos skipped (non-video) | {self._kv(token=token, filetype=(db_filetype or 'unknown'), file=fname)}")
                 self._set_result(upload_results, "gphotos_skipped", db_filetype or "non-video")
                 return
 
-            self.logger.upload_start("Google Photos", filename)
+            self.logger.upload_start("Google Photos", fname)
 
             gphotos_id = gphotos.upload(local_path, token, db_filetype=db_filetype)
             if not gphotos_id:
@@ -574,14 +519,14 @@ class ProcessingService:
 
             self.logger.upload_success("Google Photos", gphotos_id)
             took = (_now_ms() - started) / 1000.0
-            self.logger.info(f"✅ Google Photos saved | token={token} | seconds={took:.2f}")
+            self.logger.info(f"✅ Google Photos saved | {self._kv(token=token, seconds=f'{took:.2f}')}")
 
         except Exception as exc:
             msg = str(exc)
             took = (_now_ms() - started) / 1000.0
             self.logger.upload_failed("Google Photos", msg)
             self._set_result(upload_results, "gphotos_error", msg)
-            self.logger.error(f"❌ Google Photos failed | token={token} | seconds={took:.2f} | err={msg}")
+            self.logger.error(f"❌ Google Photos failed | {self._kv(token=token, seconds=f'{took:.2f}', err=msg)}")
 
     def _update_status_success(self, token: str, file_id: str) -> None:
         try:
@@ -645,13 +590,13 @@ class ProcessingService:
                 self.active_tasks = max(0, self.active_tasks)
                 return
             next_task = self.task_queue.get()
-            self.logger.info(f"➡️ Scheduling next queued task | token={next_task[0]} | active={self.active_tasks} | queued={self.task_queue.qsize()}")
+            self.logger.info(f"➡️ Scheduling next queued task | {self._kv(token=next_task[0], active=self.active_tasks, queued=self.task_queue.qsize())}")
             thread = threading.Thread(target=self.process_file, args=next_task, name=f"process:{next_task[0][:6]}")
             thread.daemon = True
             thread.start()
 
     def _cleanup_download(self, token: str) -> None:
-        base = self.downloads_dir
+        base = os.path.join(os.getcwd(), "downloads")
         paths = [
             os.path.join(base, token),
             os.path.join(base, "recovery", token),
@@ -660,17 +605,17 @@ class ProcessingService:
             if os.path.exists(p):
                 try:
                     shutil.rmtree(p)
-                    self.logger.info(f"🧹 Cleaned downloads dir | token={token} | dir={p}")
+                    self.logger.info(f"🧹 Cleaned downloads dir | {self._kv(token=token, dir=p)}")
                 except Exception as exc:
-                    self.logger.error(f"❌ Cleanup failed | token={token} | dir={p} | err={exc}")
+                    self.logger.error(f"❌ Cleanup failed | {self._kv(token=token, dir=p, err=exc)}")
 
     def enqueue_local_fallback(self, task: TaskArgs) -> None:
         with self.queue_lock:
             if self.active_tasks <= 0:
-                self.logger.info(f"▶️ Starting task immediately | token={task[0]} | active={self.active_tasks}")
+                self.logger.info(f"▶️ Starting task immediately | {self._kv(token=task[0], active=self.active_tasks)}")
                 thread = threading.Thread(target=self.process_file, args=task, name=f"process:{task[0][:6]}")
                 thread.daemon = True
                 thread.start()
             else:
                 self.task_queue.put(task)
-                self.logger.info(f"🧾 Queued task | token={task[0]} | active={self.active_tasks} | queued={self.task_queue.qsize()}")
+                self.logger.info(f"🧾 Queued task | {self._kv(token=task[0], active=self.active_tasks, queued=self.task_queue.qsize())}")
