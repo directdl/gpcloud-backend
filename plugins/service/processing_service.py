@@ -4,12 +4,13 @@ import os
 import shutil
 import threading
 import requests
+import mimetypes
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 from plugins.drive import GoogleDrive
 from plugins.gphotos import GPhotos
 from plugins.registry import get_enabled_uploaders
-from utils.logging_config import set_correlation_id, get_modern_logger
+from utils.logging_config import get_modern_logger
 from api.common import simple_encrypt
 from api.mysqldbreq import mysql_status_client
 
@@ -19,6 +20,17 @@ if TYPE_CHECKING:  # pragma: no cover
     from queueing.redis_queue import RedisJobQueue
 
 TaskArgs = Tuple[str, str, Optional[Dict[str, Any]], bool]
+
+
+def _detect_filetype(filename: str) -> str:
+    name = (filename or "").strip()
+    if not name:
+        return ""
+    ext = os.path.splitext(name)[1].lower().lstrip(".")
+    if ext:
+        return ext
+    mt, _ = mimetypes.guess_type(name)
+    return mt or ""
 
 
 class ProcessingService:
@@ -55,18 +67,35 @@ class ProcessingService:
                 link_data = self.db.get_link(token)
                 if link_data:
                     file_info = {
-                        'filename': link_data.get('filename'),
-                        'filesize': link_data.get('filesize'),
-                        'filetype': link_data.get('filetype', ''),
-                        'file_id': file_id
+                        "filename": link_data.get("filename"),
+                        "filesize": link_data.get("filesize"),
+                        "filetype": link_data.get("filetype", ""),
+                        "file_id": file_id,
                     }
-                    print(f"Using existing file info for reupload: {file_info['filename']}")
+                    print(f"Using existing file info for reupload: {file_info.get('filename')}")
                 else:
                     print(f"Warning: No database record found for token {token}, fetching from Google Drive")
                     file_info = drive.get_file_info(file_id)
 
-            local_path, filename, filesize = drive.download_file(file_id, token, file_info=file_info, job_type='process_file')
-            enable_gphotos = os.getenv('ENABLE_GPHOTOS', 'true').lower() == 'true'
+            local_path, filename, filesize = drive.download_file(file_id, token, file_info=file_info, job_type="process_file")
+
+            detected_type = (file_info or {}).get("filetype") or _detect_filetype(filename)
+            if detected_type:
+                update_method = self.db.reupload_link if is_reupload else self.db.update_link
+                try:
+                    update_method(token, filetype=detected_type)
+                except TypeError:
+                    pass
+                except Exception:
+                    pass
+                try:
+                    mysql_status_client.update_instant_fields(token=token, filetype=detected_type)
+                except TypeError:
+                    pass
+                except Exception:
+                    pass
+
+            enable_gphotos = os.getenv("ENABLE_GPHOTOS", "true").lower() == "true"
             self.logger.info(f"Upload settings - Google Photos: {enable_gphotos}")
 
             upload_threads: list[threading.Thread] = []
@@ -81,62 +110,60 @@ class ProcessingService:
                     regular_uploaders.append(uploader)
 
             for uploader in regular_uploaders:
-                thread = threading.Thread(target=self._make_upload_runner(uploader, local_path, token, is_reupload, upload_results))
-                thread.daemon = True
-                thread.start()
-                upload_threads.append(thread)
+                t = threading.Thread(target=self._make_upload_runner(uploader, local_path, token, is_reupload, upload_results))
+                t.daemon = True
+                t.start()
+                upload_threads.append(t)
 
             if enable_gphotos:
-                gphotos_thread = threading.Thread(target=self._upload_gphotos, args=(local_path, token, is_reupload, upload_results))
-                gphotos_thread.daemon = True
-                gphotos_thread.start()
-                upload_threads.append(gphotos_thread)
+                t_gp = threading.Thread(target=self._upload_gphotos, args=(local_path, token, is_reupload, upload_results))
+                t_gp.daemon = True
+                t_gp.start()
+                upload_threads.append(t_gp)
             else:
                 print("Google Photos upload disabled by environment variable")
 
-            for thread in upload_threads:
-                thread.join(timeout=300)
+            for t in upload_threads:
+                t.join(timeout=300)
 
             if viking_uploader:
                 self.logger.info("🔄 VikingFile: Starting remote upload (Google Photos priority, Worker fallback)")
-                viking_thread = threading.Thread(target=self._make_upload_runner(viking_uploader, local_path, token, is_reupload, upload_results))
-                viking_thread.daemon = True
-                viking_thread.start()
-                viking_thread.join(timeout=300)
+                t_vk = threading.Thread(target=self._make_upload_runner(viking_uploader, local_path, token, is_reupload, upload_results))
+                t_vk.daemon = True
+                t_vk.start()
+                t_vk.join(timeout=300)
 
-            link_doc = self.db.get_link(token)
+            link_doc = self.db.get_link(token) or {}
 
             required_fields = []
             if enable_gphotos:
-                required_fields.append('gphotos_id')
+                required_fields.append("gphotos_id")
 
             for uploader in regular_uploaders:
-                if uploader.id_field == 'pixeldrain_id':
-                    required_fields.append('pixeldrain_id')
-                elif uploader.id_field == 'buzzheavier_id':
-                    required_fields.append('buzzheavier_id')
+                if uploader.id_field == "pixeldrain_id":
+                    required_fields.append("pixeldrain_id")
+                elif uploader.id_field == "buzzheavier_id":
+                    required_fields.append("buzzheavier_id")
 
             if not required_fields:
                 self.logger.warning("No upload services enabled, marking as completed")
                 has_provider_success = True
             else:
-                has_provider_success = any(
-                    link_doc.get(field)
-                    for field in required_fields
-                )
+                has_provider_success = any(link_doc.get(field) for field in required_fields)
 
             if not has_provider_success:
-                enabled_services = ', '.join(required_fields)
+                enabled_services = ", ".join(required_fields)
                 raise Exception(f"All enabled upload services failed ({enabled_services})")
 
             if is_reupload:
                 self.logger.process_complete("Reupload Process", token)
-                self.db.reupload_link(token, status='completed', error=None)
+                self.db.reupload_link(token, status="completed", error=None)
             else:
                 self.logger.process_complete("File Process", token)
-                self.db.update_link(token, status='completed', error=None)
+                self.db.update_link(token, status="completed", error=None)
 
             self._update_status_success(token, file_id)
+
         except Exception as error:
             self._handle_processing_error(token, file_id, error, is_reupload)
         finally:
@@ -148,10 +175,10 @@ class ProcessingService:
         def runner() -> None:
             try:
                 if uploader.name == "VIKINGFILE":
-                    link_data = self.db.get_link(token)
-                    gphotos_id = link_data.get('gphotos_id') if link_data else None
-                    file_id = link_data.get('drive_id') if link_data else None
-                    filename = link_data.get('filename') if link_data else os.path.basename(local_path)
+                    link_data = self.db.get_link(token) or {}
+                    gphotos_id = link_data.get("gphotos_id")
+                    drive_file_id = link_data.get("drive_id")
+                    filename = link_data.get("filename") or os.path.basename(local_path)
 
                     self.logger.upload_start("VikingFile", filename)
 
@@ -159,19 +186,39 @@ class ProcessingService:
                         local_path,
                         token=token,
                         gphotos_id=gphotos_id,
-                        file_id=file_id,
-                        filename=filename
+                        file_id=drive_file_id,
+                        filename=filename,
                     )
+                    db_field = "viking_id"
                 else:
                     file_id_value = uploader.upload(local_path, token)
+                    db_field = getattr(uploader, "id_field", "") or ""
 
-                upload_results[uploader.id_field] = file_id_value
+                if not db_field:
+                    db_field = f"{uploader.name.lower()}_id"
+
+                upload_results[db_field] = file_id_value
+
                 update_method = self.db.reupload_link if is_reupload else self.db.update_link
-                update_method(token, **{uploader.id_field: file_id_value})
+                try:
+                    update_method(token, **{db_field: file_id_value})
+                except TypeError:
+                    pass
+                except Exception:
+                    pass
+
+                try:
+                    mysql_status_client.update_instant_fields(token=token, **{db_field: file_id_value})
+                except TypeError:
+                    pass
+                except Exception:
+                    pass
+
                 if uploader.name == "VIKINGFILE":
                     self.logger.upload_success("VikingFile", file_id_value)
                 else:
                     self.logger.upload_success(uploader.name, file_id_value)
+
             except Exception as exc:  # pragma: no cover
                 if uploader.name == "VIKINGFILE":
                     self.logger.upload_failed("VikingFile (optional)", str(exc))
@@ -190,14 +237,17 @@ class ProcessingService:
 
             encrypted_id = simple_encrypt(gphotos_id)
 
-            gp_identity = os.getenv('GP_IDENTITY', '')
-            if gp_identity:
-                encrypted_gp_id = simple_encrypt(gp_identity)
-            else:
-                encrypted_gp_id = None
+            gp_identity = os.getenv("GP_IDENTITY", "")
+            encrypted_gp_id = simple_encrypt(gp_identity) if gp_identity else None
 
             update_method = self.db.reupload_link if is_reupload else self.db.update_link
-            update_method(token, gphotos_id=encrypted_id, gp_id=encrypted_gp_id)
+            try:
+                update_method(token, gphotos_id=encrypted_id, gp_id=encrypted_gp_id)
+            except TypeError:
+                try:
+                    update_method(token, gphotos_id=encrypted_id)
+                except Exception:
+                    pass
 
             try:
                 mysql_status_client.update_instant_fields(
@@ -206,25 +256,31 @@ class ProcessingService:
                     gphotos_id=encrypted_id,
                     gp_id=encrypted_gp_id,
                 )
+            except TypeError:
+                try:
+                    mysql_status_client.update_instant_fields(token=token, media_key=encrypted_id, gphotos_id=encrypted_id)
+                except Exception:
+                    pass
             except Exception as exc:
                 print(f"MySQL instant fields update failed: {str(exc)}")
 
-            upload_results['gphotos_id'] = encrypted_id
+            upload_results["gphotos_id"] = encrypted_id
             if encrypted_gp_id:
-                upload_results['gp_id'] = encrypted_gp_id
+                upload_results["gp_id"] = encrypted_gp_id
 
             self.logger.upload_success("Google Photos", gphotos_id)
+
         except Exception as exc:  # pragma: no cover
             self.logger.upload_failed("Google Photos", str(exc))
-            upload_results['gphotos_error'] = str(exc)
+            upload_results["gphotos_error"] = str(exc)
 
     def _update_status_success(self, token: str, file_id: str) -> None:
         try:
             print(f"Trying MySQL status update (success) for token {token}")
             updated_via_mysql = mysql_status_client.update_status(
                 token=token,
-                status='success',
-                message='Working',
+                status="success",
+                message="Working",
                 drive_url=file_id,
             )
             if updated_via_mysql:
@@ -233,22 +289,14 @@ class ProcessingService:
         except Exception as exc:
             print(f"MySQL status update failed: {str(exc)}")
 
-        api_url = os.getenv('STATUS_API_URL')
-        api_key = os.getenv('STATUS_API_KEY')
+        api_url = os.getenv("STATUS_API_URL")
+        api_key = os.getenv("STATUS_API_KEY")
         if not api_url or not api_key:
             return
 
         try:
-            headers = {
-                'Content-Type': 'application/json',
-                'X-API-Key': api_key
-            }
-            payload = {
-                'token': token,
-                'status': 'success',
-                'message': 'Working',
-                'drive_url': file_id
-            }
+            headers = {"Content-Type": "application/json", "X-API-Key": api_key}
+            payload = {"token": token, "status": "success", "message": "Working", "drive_url": file_id}
             print(f"Posting to Status API (success) for token {token}")
             response = requests.post(api_url, json=payload, headers=headers, verify=False)
             response.raise_for_status()
@@ -264,11 +312,10 @@ class ProcessingService:
                 error_message = "File no longer exists in Google Drive or access has been revoked"
             elif "Error checking file size" in error_message:
                 error_message = "Unable to access file in Google Drive for reupload"
-
-            self.db.reupload_link(token, status='failed', error=error_message)
+            self.db.reupload_link(token, status="failed", error=error_message)
         else:
             self.logger.error(f"File processing failed for token {token}: {error_message}")
-            self.db.update_link(token, status='failed', error=error_message)
+            self.db.update_link(token, status="failed", error=error_message)
 
         self._update_status_error(token, file_id, error_message)
 
@@ -277,7 +324,7 @@ class ProcessingService:
             print(f"Trying MySQL status update (error) for token {token}")
             updated_via_mysql = mysql_status_client.update_status(
                 token=token,
-                status='error',
+                status="error",
                 message=error_message,
                 drive_url=file_id,
             )
@@ -287,22 +334,14 @@ class ProcessingService:
         except Exception as exc:
             print(f"MySQL status update failed (error): {str(exc)}")
 
-        api_url = os.getenv('STATUS_API_URL')
-        api_key = os.getenv('STATUS_API_KEY')
+        api_url = os.getenv("STATUS_API_URL")
+        api_key = os.getenv("STATUS_API_KEY")
         if not api_url or not api_key:
             return
 
         try:
-            headers = {
-                'Content-Type': 'application/json',
-                'X-API-Key': api_key
-            }
-            payload = {
-                'token': token,
-                'status': 'error',
-                'message': error_message,
-                'drive_url': file_id
-            }
+            headers = {"Content-Type": "application/json", "X-API-Key": api_key}
+            payload = {"token": token, "status": "error", "message": error_message, "drive_url": file_id}
             print(f"Posting to Status API (error) for token {token}")
             response = requests.post(api_url, json=payload, headers=headers, verify=False)
             response.raise_for_status()
@@ -323,7 +362,7 @@ class ProcessingService:
             thread.start()
 
     def _cleanup_download(self, token: str) -> None:
-        download_dir = os.path.join(os.getcwd(), 'downloads', token)
+        download_dir = os.path.join(os.getcwd(), "downloads", token)
         if os.path.exists(download_dir):
             try:
                 shutil.rmtree(download_dir)
