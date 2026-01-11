@@ -1,5 +1,6 @@
+import os
 import threading
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 
 import pymysql
 
@@ -15,25 +16,48 @@ DB_CONFIG: Dict[str, Any] = {
     'autocommit': True,
 }
 
-
 class MySQLStatusClient:
     """Thin MySQL client for updating and reading filecloud statuses directly."""
 
     def __init__(self, db_config: Optional[Dict[str, Any]] = None) -> None:
         self._db_config = db_config or DB_CONFIG
         self._lock = threading.Lock()
+        self._columns_cache: Optional[Set[str]] = None
 
     def _get_connection(self):
         return pymysql.connect(
-            host=self._db_config['host'],
-            user=self._db_config['user'],
-            password=self._db_config['password'],
-            database=self._db_config['database'],
-            port=self._db_config['port'],
-            charset=self._db_config['charset'],
-            cursorclass=self._db_config['cursorclass'],
-            autocommit=self._db_config.get('autocommit', True),
+            host=self._db_config["host"],
+            user=self._db_config["user"],
+            password=self._db_config["password"],
+            database=self._db_config["database"],
+            port=self._db_config["port"],
+            charset=self._db_config["charset"],
+            cursorclass=self._db_config["cursorclass"],
+            autocommit=self._db_config.get("autocommit", True),
         )
+
+    def _get_filecloud_columns(self) -> Set[str]:
+        if self._columns_cache is not None:
+            return self._columns_cache
+
+        sql = """
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'filecloud'
+        """
+        cols: Set[str] = set()
+        with self._lock:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (self._db_config["database"],))
+                    rows = cur.fetchall() or []
+                    for r in rows:
+                        name = (r.get("COLUMN_NAME") or "").strip()
+                        if name:
+                            cols.add(name)
+
+        self._columns_cache = cols
+        return cols
 
     def token_exists(self, token: str) -> bool:
         sql = "SELECT id FROM filecloud WHERE token = %s LIMIT 1"
@@ -53,8 +77,6 @@ class MySQLStatusClient:
         filename: Optional[str] = None,
         filesize: Optional[str] = None,
     ) -> bool:
-        """Update status/message/drive_url (and optionally filename/filesize) for an existing token.
-        Returns True when the row exists (even if values are identical and 0 rows affected)."""
         set_parts = ["status = %s", "message = %s", "drive_url = %s"]
         params = [status, message, drive_url]
         if filename is not None:
@@ -71,8 +93,7 @@ class MySQLStatusClient:
                     if rows > 0:
                         return True
                     cur.execute("SELECT 1 FROM filecloud WHERE token = %s LIMIT 1", (token,))
-                    exists = cur.fetchone() is not None
-                    return exists
+                    return cur.fetchone() is not None
 
     def update_instant_fields(
         self,
@@ -80,19 +101,33 @@ class MySQLStatusClient:
         media_key: Optional[str] = None,
         gphotos_id: Optional[str] = None,
         gp_id: Optional[str] = None,
+        filetype: Optional[str] = None,
+        pixeldrain_id: Optional[str] = None,
+        buzzheavier_id: Optional[str] = None,
+        viking_id: Optional[str] = None,
     ) -> bool:
+        columns = self._get_filecloud_columns()
+
+        pairs: Dict[str, Optional[str]] = {
+            "media_key": media_key,
+            "gphotos_id": gphotos_id,
+            "gp_id": gp_id,
+            "filetype": filetype,
+            "pixeldrain_id": pixeldrain_id,
+            "buzzheavier_id": buzzheavier_id,
+            "viking_id": viking_id,
+        }
+
         set_parts = []
         params = []
 
-        if media_key is not None:
-            set_parts.append("media_key = %s")
-            params.append(media_key)
-        if gphotos_id is not None:
-            set_parts.append("gphotos_id = %s")
-            params.append(gphotos_id)
-        if gp_id is not None:
-            set_parts.append("gp_id = %s")
-            params.append(gp_id)
+        for col, val in pairs.items():
+            if val is None:
+                continue
+            if col not in columns:
+                continue
+            set_parts.append(f"{col} = %s")
+            params.append(val)
 
         if not set_parts:
             return False
@@ -108,7 +143,6 @@ class MySQLStatusClient:
                     return cur.fetchone() is not None
 
     def upsert_status(self, token: str, status: str, message: str, drive_url: Optional[str]) -> None:
-        """Create or update token row. Creates row if not found, else updates."""
         with self._lock:
             with self._get_connection() as conn:
                 with conn.cursor() as cur:
