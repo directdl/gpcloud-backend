@@ -70,10 +70,42 @@ class MySQLStatusClient:
                     rows = cur.execute(sql, (*params, token))
                     if rows > 0:
                         return True
-                    # If no rows changed, it may still be a success if the row exists but values are identical
                     cur.execute("SELECT 1 FROM filecloud WHERE token = %s LIMIT 1", (token,))
                     exists = cur.fetchone() is not None
                     return exists
+
+    def update_instant_fields(
+        self,
+        token: str,
+        media_key: Optional[str] = None,
+        gphotos_id: Optional[str] = None,
+        gp_id: Optional[str] = None,
+    ) -> bool:
+        set_parts = []
+        params = []
+
+        if media_key is not None:
+            set_parts.append("media_key = %s")
+            params.append(media_key)
+        if gphotos_id is not None:
+            set_parts.append("gphotos_id = %s")
+            params.append(gphotos_id)
+        if gp_id is not None:
+            set_parts.append("gp_id = %s")
+            params.append(gp_id)
+
+        if not set_parts:
+            return False
+
+        sql = f"UPDATE filecloud SET {', '.join(set_parts)} WHERE token = %s"
+        with self._lock:
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    rows = cur.execute(sql, (*params, token))
+                    if rows > 0:
+                        return True
+                    cur.execute("SELECT 1 FROM filecloud WHERE token = %s LIMIT 1", (token,))
+                    return cur.fetchone() is not None
 
     def upsert_status(self, token: str, status: str, message: str, drive_url: Optional[str]) -> None:
         """Create or update token row. Creates row if not found, else updates."""
@@ -101,8 +133,4 @@ class MySQLStatusClient:
                         )
 
 
-# Module-level singleton (optional use)
 mysql_status_client = MySQLStatusClient()
-
-
-
