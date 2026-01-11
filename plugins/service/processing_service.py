@@ -36,7 +36,6 @@ class ProcessingService:
             from queue import Queue
             return Queue()
         import queue
-
         return queue.Queue()
 
     def process_file(self, token: str, file_id: str, file_info: Optional[Dict[str, Any]], is_reupload: bool = False) -> None:
@@ -74,7 +73,6 @@ class ProcessingService:
             upload_results: dict[str, str] = {}
             viking_uploader = None
 
-            # Separate VikingFile from other uploaders for sequential processing
             regular_uploaders = []
             for uploader in get_enabled_uploaders():
                 if uploader.name == "VIKINGFILE":
@@ -82,14 +80,12 @@ class ProcessingService:
                 else:
                     regular_uploaders.append(uploader)
 
-            # Start regular uploaders (PixelDrain, BuzzHeavier) in parallel
             for uploader in regular_uploaders:
                 thread = threading.Thread(target=self._make_upload_runner(uploader, local_path, token, is_reupload, upload_results))
                 thread.daemon = True
                 thread.start()
                 upload_threads.append(thread)
 
-            # Start Google Photos upload
             if enable_gphotos:
                 gphotos_thread = threading.Thread(target=self._upload_gphotos, args=(local_path, token, is_reupload, upload_results))
                 gphotos_thread.daemon = True
@@ -98,11 +94,9 @@ class ProcessingService:
             else:
                 print("Google Photos upload disabled by environment variable")
 
-            # Wait for all threads (including Google Photos) to complete
             for thread in upload_threads:
                 thread.join(timeout=300)
 
-            # Now start VikingFile upload after Google Photos is complete
             if viking_uploader:
                 self.logger.info("🔄 VikingFile: Starting remote upload (Google Photos priority, Worker fallback)")
                 viking_thread = threading.Thread(target=self._make_upload_runner(viking_uploader, local_path, token, is_reupload, upload_results))
@@ -111,22 +105,17 @@ class ProcessingService:
                 viking_thread.join(timeout=300)
 
             link_doc = self.db.get_link(token)
-            # Check only REQUIRED uploads (VikingFile is optional/bonus)
-            # Build list of required fields based on enabled services
+
             required_fields = []
-            
-            # Google Photos is required if enabled
             if enable_gphotos:
                 required_fields.append('gphotos_id')
-            
-            # Check if any enabled uploader succeeded
+
             for uploader in regular_uploaders:
                 if uploader.id_field == 'pixeldrain_id':
                     required_fields.append('pixeldrain_id')
                 elif uploader.id_field == 'buzzheavier_id':
                     required_fields.append('buzzheavier_id')
-            
-            # If no required fields (all disabled), consider it success
+
             if not required_fields:
                 self.logger.warning("No upload services enabled, marking as completed")
                 has_provider_success = True
@@ -158,26 +147,24 @@ class ProcessingService:
     def _make_upload_runner(self, uploader, local_path, token, is_reupload, upload_results):
         def runner() -> None:
             try:
-                # For VikingFile, pass additional parameters for remote upload
                 if uploader.name == "VIKINGFILE":
-                    # Get link data to extract gphotos_id and file_id
                     link_data = self.db.get_link(token)
                     gphotos_id = link_data.get('gphotos_id') if link_data else None
                     file_id = link_data.get('drive_id') if link_data else None
                     filename = link_data.get('filename') if link_data else os.path.basename(local_path)
-                    
+
                     self.logger.upload_start("VikingFile", filename)
-                    
+
                     file_id_value = uploader.upload(
-                        local_path, 
-                        token=token, 
+                        local_path,
+                        token=token,
                         gphotos_id=gphotos_id,
                         file_id=file_id,
                         filename=filename
                     )
                 else:
                     file_id_value = uploader.upload(local_path, token)
-                
+
                 upload_results[uploader.id_field] = file_id_value
                 update_method = self.db.reupload_link if is_reupload else self.db.update_link
                 update_method(token, **{uploader.id_field: file_id_value})
@@ -185,8 +172,7 @@ class ProcessingService:
                     self.logger.upload_success("VikingFile", file_id_value)
                 else:
                     self.logger.upload_success(uploader.name, file_id_value)
-            except Exception as exc:  # pragma: no cover - integration behavior
-                # VikingFile is optional - log error but don't add to upload_results error
+            except Exception as exc:  # pragma: no cover
                 if uploader.name == "VIKINGFILE":
                     self.logger.upload_failed("VikingFile (optional)", str(exc))
                 else:
@@ -202,25 +188,33 @@ class ProcessingService:
             if not gphotos_id:
                 return
 
-            # Encrypt gphotos_id for backward compatibility
             encrypted_id = simple_encrypt(gphotos_id)
-            
-            # Get GP_IDENTITY from environment and encrypt it
+
             gp_identity = os.getenv('GP_IDENTITY', '')
             if gp_identity:
-                # Encrypt only the email identity
                 encrypted_gp_id = simple_encrypt(gp_identity)
             else:
-                # Fallback if GP_IDENTITY not set
                 encrypted_gp_id = None
-            
+
             update_method = self.db.reupload_link if is_reupload else self.db.update_link
             update_method(token, gphotos_id=encrypted_id, gp_id=encrypted_gp_id)
+
+            try:
+                mysql_status_client.update_instant_fields(
+                    token=token,
+                    media_key=encrypted_id,
+                    gphotos_id=encrypted_id,
+                    gp_id=encrypted_gp_id,
+                )
+            except Exception as exc:
+                print(f"MySQL instant fields update failed: {str(exc)}")
+
             upload_results['gphotos_id'] = encrypted_id
             if encrypted_gp_id:
                 upload_results['gp_id'] = encrypted_gp_id
+
             self.logger.upload_success("Google Photos", gphotos_id)
-        except Exception as exc:  # pragma: no cover - integration behavior
+        except Exception as exc:  # pragma: no cover
             self.logger.upload_failed("Google Photos", str(exc))
             upload_results['gphotos_error'] = str(exc)
 
@@ -259,7 +253,7 @@ class ProcessingService:
             response = requests.post(api_url, json=payload, headers=headers, verify=False)
             response.raise_for_status()
             print(f"Status API updated for token {token}")
-        except Exception as exc:  # pragma: no cover - network behavior
+        except Exception as exc:  # pragma: no cover
             print(f"Error updating status API: {str(exc)}")
 
     def _handle_processing_error(self, token: str, file_id: str, error: Exception, is_reupload: bool) -> None:
@@ -313,7 +307,7 @@ class ProcessingService:
             response = requests.post(api_url, json=payload, headers=headers, verify=False)
             response.raise_for_status()
             print(f"Status API updated for token {token} (error)")
-        except Exception as exc:  # pragma: no cover - network behavior
+        except Exception as exc:  # pragma: no cover
             print(f"Error updating status API: {str(exc)}")
 
     def _schedule_next_task(self) -> None:
@@ -333,7 +327,7 @@ class ProcessingService:
         if os.path.exists(download_dir):
             try:
                 shutil.rmtree(download_dir)
-            except Exception:  # pragma: no cover - disk behavior
+            except Exception:  # pragma: no cover
                 pass
 
     def enqueue_local_fallback(self, task: TaskArgs) -> None:
